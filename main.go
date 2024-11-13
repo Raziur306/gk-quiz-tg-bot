@@ -1,21 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 	"log"
 	"os"
-	"context"
 	"strings"
 )
 
 import "github.com/google/generative-ai-go/genai"
 import "google.golang.org/api/option"
 
-func main() {
+// Store correct answers for active questions
+var activeQuestions = make(map[int64]string)
 
-	//check env file loaded
+func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatalf("Error loading .env file")
@@ -28,7 +29,6 @@ func main() {
 		log.Panic(err)
 	}
 
-	// Print the bot username
 	fmt.Printf("Bot authorized on account %s\n", bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
@@ -38,9 +38,10 @@ func main() {
 	for update := range updates {
 		if update.Message != nil {
 			handleUserInput(bot, update)
+		} else if update.CallbackQuery != nil {
+			handleCallbackQuery(bot, update)
 		}
 	}
-
 }
 
 func handleUserInput(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
@@ -52,19 +53,73 @@ func handleUserInput(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 			"Type /startQuiz to begin!"
 		bot.Send(msg)
 	case "/startQuiz":
-		msg.Text = "Starting the quiz! Get ready for the first question."
+		msg.Text = "Starting the quiz! Get ready for the question."
 		bot.Send(msg)
-		question, options, _, err := getQuizQuestionFromLLM()
+		question, options, correctAnswer, err := getQuizQuestionFromLLM()
 		if err != nil {
 			msg.Text = "Sorry, I couldn't fetch a question right now. Please try again later."
 			bot.Send(msg)
 		} else {
+			// Store the correct answer for this chat
+			activeQuestions[update.Message.Chat.ID] = correctAnswer
 			sendQuestionToUser(bot, update, question, options)
 		}
 	default:
 		msg.Text = "I don't understand that command. Type /startQuiz to begin the quiz."
 		bot.Send(msg)
 	}
+}
+
+func handleCallbackQuery(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	query := update.CallbackQuery
+	selectedOption := strings.Split(query.Data, "_")[1]
+	correctAnswer := activeQuestions[query.Message.Chat.ID]
+	correctNum := strings.Split(correctAnswer, ".")[0]
+	correctNum = strings.TrimSpace(correctNum)
+
+	fmt.Print("Correct Answer", correctAnswer)
+
+	if query.Data == "next_question" {
+		update := tgbotapi.Update{
+			Message: &tgbotapi.Message{
+				Chat: &tgbotapi.Chat{
+					ID: query.Message.Chat.ID,
+				},
+				Text: "/startQuiz",
+			},
+		}
+		handleUserInput(bot, update)
+	}
+
+	var responseText string
+	if selectedOption == correctNum {
+		responseText = "✅ Correct! Well done!"
+	} else {
+		responseText = fmt.Sprintf("❌ Wrong! The correct answer was: %s", correctAnswer)
+	}
+
+	callback := tgbotapi.NewCallback(query.ID, "")
+	bot.Send(callback)
+
+	// Edit the message text to show whether the answer was correct or incorrect
+	edit := tgbotapi.NewEditMessageText(
+		query.Message.Chat.ID,
+		query.Message.MessageID,
+		query.Message.Text+"\n\n"+responseText,
+	)
+
+	// Create a "Next Question" button
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Next Question", "next_question"),
+		),
+	)
+
+	edit.ReplyMarkup = &keyboard
+	bot.Send(edit)
+
+	// Delete the active question after processing
+	delete(activeQuestions, query.Message.Chat.ID)
 }
 
 func getQuizQuestionFromLLM() (string, []string, string, error) {
@@ -102,40 +157,33 @@ func getQuizQuestionFromLLM() (string, []string, string, error) {
 					return "", nil, "", fmt.Errorf("unexpected format of response content")
 				}
 				question := lines[0]
-				options := []string{ // The 4 options
-					strings.TrimSpace(strings.Split(lines[1], ".")[1]),
-					strings.TrimSpace(strings.Split(lines[2], ".")[1]),
-					strings.TrimSpace(strings.Split(lines[3], ".")[1]),
-					strings.TrimSpace(strings.Split(lines[4], ".")[1]),
+				options := []string{
+					lines[1],
+					lines[2],
+					lines[3],
+					lines[4],
 				}
 				answerLine := strings.Split(lines[5], ":")
-				correctAnswer := strings.TrimSpace(answerLine[1]);
+				correctAnswer := strings.TrimSpace(answerLine[1])
 				return question, options, correctAnswer, nil
-
 			}
 		default:
 			fmt.Println("Unexpected Part type")
 			return "", nil, "", fmt.Errorf("unexpected Part type")
 		}
-
-	} else {
-		fmt.Println("No content in response")
 	}
 
-	if len(resp.Candidates) > 0 && len(resp.Candidates[0].SafetyRatings) > 0 {
-		fmt.Printf("Safety Ratings: %+v\n", resp.Candidates[0].SafetyRatings)
-	}
 	return "", nil, "", fmt.Errorf("nil response")
 }
 
 func sendQuestionToUser(bot *tgbotapi.BotAPI, update tgbotapi.Update, question string, options []string) {
-msg := tgbotapi.NewMessage(update.Message.Chat.ID, question)
-var keyboardRows [][]tgbotapi.InlineKeyboardButton
-for i, option := range options {
-	keyboardRows = append(keyboardRows, []tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardButtonData(option, fmt.Sprintf("option_%d", i+1)),
-	})
-}
-msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(keyboardRows...)
-bot.Send(msg)
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID, question)
+	var keyboardRows [][]tgbotapi.InlineKeyboardButton
+	for i, option := range options {
+		keyboardRows = append(keyboardRows, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData(option, fmt.Sprintf("option_%d", i+1)),
+		})
+	}
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(keyboardRows...)
+	bot.Send(msg)
 }
